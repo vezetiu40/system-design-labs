@@ -1,0 +1,238 @@
+
+## Scopul laboratorului
+
+Scopul este de a defini cerințe măsurabile de calitate, de a estima numărul de cereri pe secundă pentru trei niveluri de utilizatori și de a calcula spațiul necesar pentru stocarea datelor bursiere.
+
+## Ipoteze generale
+
+- Fiecare acțiune a utilizatorului generează o cerere către Dashboard.
+- O cerere către Dashboard nu înseamnă automat o cerere către furnizorul de date.
+- Se folosesc 300, 3.000 și 30.000 de utilizatori concurenți.
+- Pentru latență, cel puțin 95% dintre citirile corecte trebuie să se încheie în maximum 2 secunde.
+- Dimensiunile datelor sunt estimări brute, fără indexuri, replici sau overhead-ul bazei de date.
+
+# 1. Quality requirements
+
+## 1.1. Read latency
+
+**Measure:** timpul dintre trimiterea cererii de citire și disponibilitatea răspunsului complet în interfață.
+
+**Target:** p95 ≤ 2 secunde.
+
+**Operating condition:** în perioadele aglomerate, pentru toate cele trei niveluri de utilizatori.
+
+Dacă o citire corectă depășește 2 secunde, aceasta nu respectă ținta. Un răspuns rapid care indică „indisponibil” nu este considerat automat o citire corectă.
+
+## 1.2. Availability
+
+Dashboard-ul este disponibil dacă utilizatorul autentificat poate utiliza fluxurile principale: Overview, Filter, Stock price, History, Watchlist și Search.
+
+Ținte propuse:
+
+- Orele pieței: **99,9%**.
+- Restul zilei: **99,5%**.
+
+În timpul tranzacționării, informația este mai importantă, de aceea folosim o țintă mai strictă.
+
+Presupunem 22 de zile de tranzacționare într-o perioadă de 30 de zile și un program de 6,5 ore pe zi.
+
+- Orele pieței: 22 × 6,5 = 143 ore.
+- Restul perioadei: 30 × 24 − 143 = 577 ore.
+
+Formula:
+
+`Downtime = durata perioadei × (1 − disponibilitatea)`
+
+| Fereastră | Durată | Disponibilitate | Buget de nefuncționare |
+|---|---:|---:|---:|
+| Orele pieței | 143 ore | 99,9% | 143 × 0,001 = 8,58 minute |
+| Restul zilei | 577 ore | 99,5% | 577 × 0,005 = 173,1 minute |
+
+Acestea sunt estimări bazate pe programul presupus. În practică, ferestrele se măsoară separat pe parcursul aceleiași perioade de 30 de zile.
+
+## 1.3. Consistency
+
+**Stock price**
+- Măsură: vechimea datelor față de ora furnizorului.
+- Țintă: datele nu trebuie să fie mai vechi de 15 minute pentru a fi considerate actuale.
+- Dacă depășesc limita sau nu există un preț valid, se afișează „întârziat” sau „indisponibil”, nu zero.
+
+**Watchlist**
+- După confirmarea unei modificări, următoarea citire a listei de către același utilizator trebuie să reflecte modificarea.
+- Un utilizator nu poate citi sau modifica lista altui utilizator.
+
+# 2. Steady RPS estimates
+
+RPS înseamnă *requests per second* — cereri pe secundă.
+
+Formula:
+
+`RPS = utilizatori concurenți × proporția participanților × acțiuni per utilizator / intervalul în secunde`
+
+| Read | 300 Users | 3.000 Users | 30.000 Users |
+|---|---:|---:|---:|
+| Overview | 300 × 0,70 / 30 = **7** | 3.000 × 0,70 / 30 = **70** | 30.000 × 0,70 / 30 = **700** |
+| Filter | 300 × 0,50 × 3 / 60 = **7,5** | 3.000 × 0,50 × 3 / 60 = **75** | 30.000 × 0,50 × 3 / 60 = **750** |
+| Stock price | 300 × 0,20 × 1 / 1 = **60** | 3.000 × 0,20 / 1 = **600** | 30.000 × 0,20 / 1 = **6.000** |
+| History | 300 × 0,20 / 300 = **0,2** | 3.000 × 0,20 / 300 = **2** | 30.000 × 0,20 / 300 = **20** |
+| Watchlist | 300 × 0,60 / 60 = **3** | 3.000 × 0,60 / 60 = **30** | 30.000 × 0,60 / 60 = **300** |
+| Search | 300 × 0,10 × 3 / 60 = **1,5** | 3.000 × 0,10 × 3 / 60 = **15** | 30.000 × 0,10 × 3 / 60 = **150** |
+| **Steady total** | **79,2 RPS** | **792 RPS** | **7.920 RPS** |
+
+# 3. Market-open RPS estimates
+
+La deschiderea pieței se adaugă două fluxuri:
+
+1. 30% dintre utilizatori reîncarcă Overview o dată în 10 secunde.
+2. 60% dintre acest grup reîncarcă și Watchlist, adică 30% × 60% = 18% dintre toți utilizatorii.
+
+Formule:
+
+- Overview suplimentar = `utilizatori × 0,30 / 10`
+- Watchlist suplimentar = `utilizatori × 0,18 / 10`
+- Rezerva de capacitate = `subtotal × 10%`
+- Ținta finală = `rotunjire în sus(subtotal × 1,10)`
+
+| Market-open calculation | 300 Users | 3.000 Users | 30.000 Users |
+|---|---:|---:|---:|
+| Steady read traffic | 79,2 | 792 | 7.920 |
+| Additional Overview refresh flow | 9 | 90 | 900 |
+| Additional Watchlist refresh flow | 5,4 | 54 | 540 |
+| **Market-open subtotal** | **93,6** | **936** | **9.360** |
+| 10% capacity margin | 9,36 | 93,6 | 936 |
+| **Rounded-up market-open target** | **103 RPS** | **1.030 RPS** | **10.296 RPS** |
+
+Traficul steady pentru Overview și Watchlist nu este numărat din nou; cele două fluxuri sunt suplimentare.
+
+# 4. Storage estimates
+
+## 4.1. Definirea unui Stock
+
+Pentru prima versiune, un **Stock** este o acțiune comună (*common stock*) listată pe Nasdaq Stock Market din SUA.
+
+Decizii de produs:
+
+- Piață: Nasdaq Stock Market, SUA.
+- Incluse: acțiuni comune listate.
+- Excluse: acțiuni preferențiale, ETF-uri, fonduri, obligațiuni și opțiuni.
+- Instrumentele delistate nu apar în căutarea implicită.
+- Număr estimat pentru calcule: **2.500 de acțiuni**. Aceasta este o valoare rotunjită pentru modelul de capacitate, nu un număr exact verificat al tuturor acțiunilor eligibile.
+
+Surse pentru verificare:
+- SEC Investor.gov, informații despre acțiuni: https://www.investor.gov/introduction-investing/investing-basics/investment-products/stocks
+- Nasdaq, descrierea Nasdaq Composite: https://indexes.nasdaq.com/Index/Overview/COMP
+
+Sursele trebuie verificate înainte de predare pentru a confirma definiția folosită și numărul actual de instrumente. Data consultării documentului: 20.10.2026.
+
+## 4.2. Date sincronizate
+
+| Set de date | Câmpuri păstrate | Scop |
+|---|---|---|
+| Stock reference data | simbol, nume, bursă, tip, sector, statut, monedă | Căutare și filtre |
+| Latest prices | simbol, preț, monedă, ora furnizorului, indicator de întârziere | Overview și Stock price |
+| Price history | simbol, timestamp, deschidere, maxim, minim, închidere, volum | Graficul istoricului |
+| Other selected data | Nu se includ date suplimentare | Nu sunt necesare pentru fluxurile de bază |
+
+Ipoteze de sincronizare:
+
+- Datele despre instrumente: zilnic și la schimbări de listare.
+- Ultimul preț: actualizare la fiecare minut în timpul sesiunii, dacă furnizorul permite.
+- Istoric: un punct pe minut pentru o sesiune de 6,5 ore, adică 390 puncte per acțiune pe zi.
+- Retenția istoricului: 365 de zile.
+- Un punct istoric ocupă în medie 100 bytes.
+
+## 4.3. Exemple de înregistrări
+
+**Stock reference data:**
+
+```json
+{
+  "symbol": "EXM",
+  "name": "Example Corporation",
+  "exchange": "NASDAQ",
+  "instrumentType": "common_stock",
+  "sector": "Technology",
+  "currency": "USD",
+  "active": true
+}
+```
+
+Dimensiune estimată: **1.000 bytes per înregistrare**.
+
+**Latest price:**
+
+```json
+{
+  "symbol": "EXM",
+  "price": 125.45,
+  "currency": "USD",
+  "providerTimestamp": "2026-10-20T15:30:00Z",
+  "delayed": false
+}
+```
+
+Dimensiune estimată: **200 bytes per înregistrare**.
+
+**Price history:**
+
+```json
+{
+  "symbol": "EXM",
+  "timestamp": "2026-10-20T15:30:00Z",
+  "open": 125.10,
+  "high": 125.70,
+  "low": 124.90,
+  "close": 125.45,
+  "volume": 182340
+}
+```
+
+Dimensiune estimată: **100 bytes per înregistrare**. Aceste dimensiuni sunt ipoteze, nu măsurători dintr-o bază de date implementată.
+
+## 4.4. Calculul spațiului brut
+
+Formule:
+
+`raw storage = număr de înregistrări × bytes per record`
+
+`history records = Stocks × puncte pe zi per Stock × zile păstrate`
+
+Folosim 2.500 de acțiuni.
+
+- Referințe: 2.500 × 1.000 bytes = 2.500.000 bytes ≈ **2,5 MB**.
+- Ultimele prețuri: 2.500 × 200 bytes = 500.000 bytes ≈ **0,5 MB**.
+- Istoric zilnic: 2.500 × 390 × 100 bytes = 97.500.000 bytes ≈ **97,5 MB/zi**.
+- Înregistrări istorice pentru 365 zile: 2.500 × 390 × 365 = **355.875.000**.
+- Istoric anual: 355.875.000 × 100 bytes = 35.587.500.000 bytes ≈ **35,59 GB**.
+- Stocare inițială cu o zi de istoric: 2,5 MB + 0,5 MB + 97,5 MB = **100,5 MB**.
+
+| Data set | Product decision and retention | Record-count calculation | Bytes per record | Raw storage |
+|---|---|---:|---:|---:|
+| Stock reference data | 2.500 de acțiuni comune | 2.500 | 1.000 | 2,5 MB |
+| Latest prices | Un ultim preț per acțiune | 2.500 | 200 | 0,5 MB |
+| Price history | 390 puncte/zi/acțiune; 365 zile | 2.500 × 390 × 365 = 355.875.000 | 100 | 35,59 GB |
+| Other selected data | Nu se include | 0 | — | 0 bytes |
+| **Total anual brut** | Fără indexuri, replici și overhead | — | — | **Aproximativ 35,59 GB** |
+
+Rezumat:
+
+- Stocare inițială cu o zi de istoric: **100,5 MB**.
+- Istoric adăugat zilnic: **97,5 MB**.
+- Istoric pentru un an: **35,59 GB**.
+
+O implementare reală va necesita spațiu suplimentar pentru indexuri, replicare, metadate și copii de siguranță.
+
+# 5. Potential bottlenecks
+
+| Quality | Potential bottleneck | Evidence from this lab | Possible effect | What to measure next |
+|---|---|---|---|---|
+| Latency | Interogările de istoric și căutările pot citi multe înregistrări. | 7.920 RPS steady la 30.000 de utilizatori și 355.875.000 puncte istorice/an. | p95 poate depăși 2 secunde. | p50/p95/p99, timpul SQL, cache hit rate și dimensiunea răspunsului. |
+| Consistency | Cache-ul poate păstra un preț prea vechi sau modificarea Watchlist poate să nu fie vizibilă imediat. | Prețul are o limită de prospețime de 15 minute. | Preț învechit sau listă incorectă. | Vechimea datelor și timpul dintre scriere și următoarea citire. |
+| Throughput | API-ul, baza de date sau cache-ul pot deveni saturate. | Ținte market-open de 103, 1.030 și 10.296 RPS. | Cereri în coadă, erori și latență ridicată. | Cereri/secundă, CPU, conexiuni DB, erori și latență la teste de încărcare. |
+| Availability | Furnizorul extern sau baza de date pot deveni indisponibile. | Dashboard-ul depinde de furnizor și de stocarea proprie. | Date indisponibile și nerespectarea țintei uptime. | Disponibilitatea pe fiecare fereastră, rata erorilor și durata incidentelor. |
+
+Acestea sunt ipoteze de bottleneck, nu probleme demonstrate. RPS-ul mare indică ce trebuie investigat; testele și măsurătorile sunt necesare pentru a confirma cauza.
+
+# Concluzie
+
+Traficul steady estimat este de 79,2, 792 și 7.920 RPS pentru 300, 3.000 și 30.000 de utilizatori. Cu fluxurile suplimentare de la deschiderea pieței și rezerva de 10%, țintele de capacitate sunt 103, 1.030 și 10.296 RPS. Pentru 2.500 de acțiuni și un an de istoric la un punct pe minut, stocarea brută a istoricului este estimată la aproximativ 35,59 GB. Estimările trebuie validate prin teste de încărcare și măsurarea dimensiunilor reale ale datelor.
