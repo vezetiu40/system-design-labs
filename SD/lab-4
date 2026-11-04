@@ -1,0 +1,459 @@
+Laboratorul 4 – Scalează traseul de citire al Dashboard-ului
+1. Scalarea serviciului și rutarea cererilor
+
+Date inițiale:
+
+Utilizatori: 3.000.
+Citiri Stock Price: 600 RPS.
+Marjă de capacitate: 20%.
+Capacitate per instanță Dashboard: 250 RPS.
+Calculăm ținta:
+
+600 × 1.2 = 720 RPS
+
+Numărul minim de instanțe:
+
+N = [720/250] = 3
+
+Pentru a păstra capacitatea după pierderea unei instanțe avem nevoie de încă una:
+
+N = 4
+
+Capacitate după defectare:
+
+3 × 250 = 750 RPS
+
+Decizie: folosim 4 instanțe Dashboard, care asigură 750 RPS după pierderea unei instanțe, peste ținta de 720 RPS.
+
+Distribuirea traficului
+
+Alegem L7 Load Balancer + Least Connections.
+
+Avantaje:
+
+Distribuie cererile HTTP/HTTPS.
+Verifică sănătatea instanțelor.
+Redirecționează traficul când o instanță cade.
+Trimite cererile către instanțele cu mai puține conexiuni active.
+Limitare: numărul conexiunilor nu reflectă întotdeauna costul real de procesare al cererilor.
+
+Starea după pierderea unei instanțe
+
+
+Date	Stocare
+Prețuri și timestamp-uri	Market Data Store
+Istoric tranzacții	Stocare durabilă
+Date utilizatori	Stocare durabilă
+Cache L1	Memorie locală temporară
+Cache L2	Redis
+Pierderea unei instanțe elimină doar cache-ul local. Datele importante rămân în stocarea durabilă.
+
+2. Scalarea Market Data Store
+
+Un nod poate servi maximum 400 RPS pentru citiri publice.
+
+N = [720/400] = 2
+
+Arhitectura aleasă:
+
+1 Write Leader pentru scrieri și citiri care necesită ultima valoare.
+2 Read Replicas pentru citiri publice.
+Capacitate:
+
+2 × 400 = 800 RPS
+
+Limitare: dacă o replică se defectează, rămân doar 400 RPS. Pentru păstrarea țintei de 720 RPS după pierderea unei replici sunt necesare trei replici de citire.
+
+Container View
+
+
+mermaid
+flowchart TB
+    U[Browser]
+    LB[L7 Load Balancer]
+
+    subgraph Dashboard
+        D1[Instance 1 - L1]
+        D2[Instance 2 - L1]
+        D3[Instance 3 - L1]
+        D4[Instance 4 - L1]
+    end
+
+    R[Redis L2 Cache]
+
+    subgraph Market_Data_Store
+        P[(Write Leader)]
+        R1[(Read Replica 1)]
+        R2[(Read Replica 2)]
+    end
+
+    MP[Market Data Provider]
+
+    U --> LB
+    LB --> D1
+    LB --> D2
+    LB --> D3
+    LB --> D4
+
+    D1 <--> R
+    D2 <--> R
+    D3 <--> R
+    D4 <--> R
+
+    D1 --> R1
+    D2 --> R2
+    D3 --> R1
+    D4 --> R2
+
+    R1 --> P
+    R2 --> P
+    MP --> P
+3. Pune în cache două citiri publice
+
+Alegem:
+
+Stock Price – prețul acțiunilor.
+Overview – rezumatul public al pieței.
+Ambele sunt date publice și nu conțin informații private ale utilizatorilor.
+
+3.1. Stock Price
+
+Munca eliminată: interogările repetate către baza de date pentru același preț și transferul repetat al acelorași informații.
+
+
+Decizie	Contract cache
+Cheie	stock:price:{symbol}
+Valoare	Simbol, preț, monedă, source_timestamp, accepted_at, cached_at
+Sursă	Market Data Store - AcceptedMarketPrices
+L1 TTL	2 secunde
+Redis TTL	Maximum 75 secunde
+Fresh	Maximum 15 secunde vechime a sursei
+Stale permis	Maximum 60 secunde
+Expirat	Nu se prezintă ca preț actual
+Defectare	Valoare stale cu avertisment sau indisponibilitate
+Exemplu JSON:
+
+
+json
+{
+  "symbol": "AAPL",
+  "price": 225.50,
+  "currency": "USD",
+  "source_timestamp": "2026-11-04T09:55:00Z",
+  "accepted_at": "2026-11-04T09:55:02Z",
+  "cached_at": "2026-11-04T09:55:03Z"
+}
+source_timestamp indică momentul producerii datelor, accepted_at momentul acceptării, iar cached_at momentul salvării în cache.
+
+Diagrama de secvență Stock Price
+
+
+mermaid
+sequenceDiagram
+    actor U as User
+    participant D as Dashboard
+    participant L1 as Local Cache
+    participant R as Redis
+    participant DB as Market Data Store
+
+    U->>D: GET /stocks/AAPL
+    D->>L1: GET stock:price:AAPL
+
+    alt L1 HIT
+        L1-->>D: Fresh price
+        D-->>U: Return price
+    else L1 MISS
+        L1-->>D: Missing
+        D->>R: GET stock:price:AAPL
+
+        alt Redis HIT
+            R-->>D: Price JSON
+            D->>L1: Save TTL 2s
+            D-->>U: Return price
+        else Redis MISS
+            R-->>D: Missing
+            D->>DB: Read durable price
+
+            alt Database available
+                DB-->>D: Accepted price
+                D->>R: SET JSON EX 75
+                D->>L1: Save price
+                D-->>U: Return price
+            else Database unavailable
+                DB-->>D: Unavailable
+                D-->>U: Price unavailable
+            end
+        end
+    end
+
+    opt Stale value permitted
+        D-->>U: Return delayed price
+        D->>DB: Background refresh
+        DB-->>D: Refresh failed
+        Note over D: Keep stale within 60s limit
+    end
+3.2. Overview
+
+Munca eliminată: agregarea repetată a prețurilor, calculul variațiilor procentuale și numărarea acțiunilor.
+
+
+Decizie	Contract cache
+Cheie	market:overview:{market}:{currency}
+Valoare	Indice, variație, volum și timestamp
+Sursă	Market Data Store - PublicMarketOverview
+L1 TTL	5 secunde
+Redis TTL	Maximum 150 secunde
+Fresh	Maximum 30 secunde vechime
+Stale permis	Maximum 120 secunde
+Expirat	Nu se prezintă ca actual
+Defectare	Valoare stale cu avertisment sau indisponibilitate
+Cheie concretă:
+
+market:overview:NASDAQ:USD
+
+Exemplu JSON:
+
+
+json
+{
+  "market": "NASDAQ",
+  "currency": "USD",
+  "index_value": 18450.25,
+  "change_percent": 0.85,
+  "advancing_stocks": 1250,
+  "declining_stocks": 720,
+  "total_volume": 85000000,
+  "source_timestamp": "2026-11-04T09:55:00Z",
+  "cached_at": "2026-11-04T09:55:05Z"
+}
+Diagrama de secvență Overview
+
+
+mermaid
+sequenceDiagram
+    actor U as User
+    participant D as Dashboard
+    participant L1 as Local Cache
+    participant R as Redis
+    participant DB as Market Data Store
+
+    U->>D: GET /market/overview
+    D->>L1: GET market:overview:NASDAQ:USD
+
+    alt L1 HIT
+        L1-->>D: Overview JSON
+        D-->>U: Return overview
+    else L1 MISS
+        L1-->>D: Missing
+        D->>R: GET market:overview:NASDAQ:USD
+
+        alt Redis HIT
+            R-->>D: Overview JSON
+            D->>L1: Save TTL 5s
+            D-->>U: Return overview
+        else Redis MISS
+            R-->>D: Missing
+            D->>DB: Read and aggregate
+
+            alt Database available
+                DB-->>D: Overview result
+                D->>R: SET JSON EX 150
+                D->>L1: Save overview
+                D-->>U: Return overview
+            else Database unavailable
+                DB-->>D: Unavailable
+                D-->>U: Overview unavailable
+            end
+        end
+    end
+
+    opt Stale value permitted
+        D-->>U: Return delayed overview
+        D->>DB: Background refresh
+        DB-->>D: Refresh failed
+        Note over D: Keep stale within 120s limit
+    end
+3.3. Reguli de securitate
+
+Nu introducem date private în cache-ul public.
+Cheile publice nu conțin identificatori personali.
+Datele private sunt izolate pentru fiecare utilizator.
+Redis nu este sursa principală de adevăr.
+Cache-ul poate fi șters fără pierderea datelor durabile.
+4. Warm-up și fallback
+
+Înainte de deschiderea pieței încărcăm în Redis doar cheile importante:
+
+Prețurile acțiunilor populare.
+Acțiunile din indicii principali.
+Overview pentru piețele suportate.
+Agregatele publice solicitate frecvent.
+După recuperarea Redis repetăm încărcarea gradual, pornind din sursa durabilă.
+
+Protecția sursei
+
+Maximum 100 RPS pentru citirile de rezervă, ca limită operațională propusă.
+Coadă limitată pentru actualizări.
+Deduplicarea cererilor simultane (single-flight).
+Retry cu backoff și jitter.
+Circuit breaker.
+
+Situație	Rezultat pentru utilizator
+Warm-up complet	Date normale
+Warm-up incomplet	Date disponibile sau avertisment
+Date stale permise	Date întârziate
+Fără date valide	Date indisponibile
+Redis indisponibil	Fallback controlat
+Capacitate fallback epuizată	HTTP 503
+Sursă durabilă indisponibilă	Nu se prezintă date false ca actuale
+Nu presupunem o rată de cache hit pentru dimensionarea instanțelor.
+
+5. Implementarea Redis prin redis-cli
+
+Documentație oficială:
+
+https://redis.io/docs/latest/operate/oss_and_stack/install/install-stack/
+https://redis.io/docs/latest/develop/tools/cli/
+https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/
+Verificăm conexiunea:
+
+
+bash
+redis-cli PING
+Rezultat:
+
+
+text
+PONG
+5.1. Stock Price
+
+1. Verificăm cheia:
+
+
+bash
+redis-cli GET stock:price:AAPL
+Rezultat:
+
+
+text
+(nil)
+2. Citim sursa durabilă:
+
+
+sql
+SELECT symbol, price, currency,
+source_timestamp, accepted_at
+FROM AcceptedMarketPrices
+WHERE symbol = 'AAPL';
+3. Introducem valoarea JSON:
+
+
+bash
+redis-cli SET stock:price:AAPL '{"symbol":"AAPL","price":225.50,"currency":"USD","source_timestamp":"2026-11-04T09:55:00Z","accepted_at":"2026-11-04T09:55:02Z","cached_at":"2026-11-04T09:55:03Z"}' EX 75
+Rezultat:
+
+
+text
+OK
+4. Verificăm valoarea:
+
+
+bash
+redis-cli GET stock:price:AAPL
+Rezultat: valoarea JSON introdusă anterior.
+
+5. Verificăm TTL:
+
+
+bash
+redis-cli TTL stock:price:AAPL
+Rezultat exemplificativ:
+
+
+text
+(integer) 72
+5.2. Overview
+
+1. Verificăm cheia:
+
+
+bash
+redis-cli GET market:overview:NASDAQ:USD
+Rezultat:
+
+
+text
+(nil)
+2. Citim sursa durabilă:
+
+
+sql
+SELECT market, currency, index_value,
+change_percent, advancing_stocks,
+declining_stocks, total_volume, source_timestamp
+FROM PublicMarketOverview
+WHERE market = 'NASDAQ'
+AND currency = 'USD';
+3. Introducem valoarea JSON:
+
+
+bash
+redis-cli SET market:overview:NASDAQ:USD '{"market":"NASDAQ","currency":"USD","index_value":18450.25,"change_percent":0.85,"advancing_stocks":1250,"declining_stocks":720,"total_volume":85000000,"source_timestamp":"2026-11-04T09:55:00Z","cached_at":"2026-11-04T09:55:05Z"}' EX 150
+Rezultat:
+
+
+text
+OK
+4. Verificăm valoarea:
+
+
+bash
+redis-cli GET market:overview:NASDAQ:USD
+Rezultat: valoarea JSON introdusă anterior.
+
+5. Verificăm TTL:
+
+
+bash
+redis-cli TTL market:overview:NASDAQ:USD
+Rezultat exemplificativ:
+
+
+text
+(integer) 147
+5.3. Persistența Redis
+
+Alegem Redis fără persistență RDB sau AOF, deoarece este doar un cache.
+
+După repornire, Redis poate fi gol și valorile se reconstruiesc din Market Data Store.
+
+TTL nu garantează actualitatea datelor. De exemplu, o valoare introdusă în Redis poate avea TTL de 75 secunde, dar timestamp-ul furnizorului poate indica date vechi.
+
+De aceea verificăm separat:
+
+source_timestamp;
+accepted_at;
+cached_at.
+6. Modificări față de laboratoarele 2 și 3
+
+
+Componentă	Modificare
+Dashboard	Patru instanțe
+Load Balancer	L7 Least Connections
+Market Data Store	Un lider și două replici
+Stock Price	Cache L1 și Redis
+Overview	Cache L1 și Redis
+Date private	Rămân izolate
+Disponibilitate	Warm-up și fallback
+Consistență	Lider pentru citirile care necesită ultima valoare
+Limitare: două replici oferă 800 RPS normal, dar numai 400 RPS după pierderea uneia. Trei replici sunt necesare pentru păstrarea țintei de 720 RPS în această situație.
+
+7. Concluzie
+
+Personal Investment Dashboard este scalat pentru 3.000 de utilizatori și 600 RPS, cu o marjă de 20%.
+
+Cele patru instanțe Dashboard păstrează 750 RPS după pierderea unei instanțe, peste ținta de 720 RPS.
+
+Market Data Store oferă 800 RPS prin două replici de citire. Cache-ul L1 și Redis reduc interogările repetitive pentru Stock Price și Overview.
+
+Prin warm-up, stale-while-revalidate și fallback controlat, sistemul poate gestiona defectările fără pierderea datelor durabile sau expunerea informațiilor private ale utilizatorilor.
