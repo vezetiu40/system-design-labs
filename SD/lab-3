@@ -1,0 +1,390 @@
+# Laboratorul 3: Desenează limita Dashboard-ului
+
+## Context și ipoteze de proiectare
+
+**Sistem:** Personal Investment Dashboard.
+
+Aplicația permite utilizatorilor autentificați să răsfoiască și să filtreze acțiuni (*Stocks*), să consulte prețurile și istoricul acestora și să administreze un *Watchlist* privat. Aplicația nu efectuează tranzacții bursiere.
+
+### Ipoteze
+
+- Utilizatorul trebuie să fie autentificat pentru a administra Watchlist-ul privat.
+- Market Data Provider furnizează date întârziate, nu date în timp real.
+- Datele de piață sunt citite din baza de date. Nu se trimite o cerere nouă către furnizor la fiecare citire.
+- Sincronizarea este pornită de un proces programat sau când datele lipsesc ori sunt prea vechi.
+- Datele furnizorului sunt validate înainte de a fi salvate.
+- Dacă sincronizarea eșuează, datele acceptate anterior rămân în baza de date.
+- Datele prea vechi nu sunt prezentate drept actuale.
+- Credențialele furnizorului sunt păstrate numai pe server.
+- Modificările Watchlist-ului sunt confirmate numai după salvarea cu succes în baza de date.
+
+## 1. Diagrama System Context
+
+Diagrama prezintă sistemul ca o singură unitate, utilizatorul și furnizorul extern de date.
+
+```mermaid
+flowchart LR
+    User["Utilizator autentificat"]
+    Dashboard["Personal Investment Dashboard"]
+    Provider["Market Data Provider"]
+
+    User -->|"Răsfoiește și filtrează Stocks; citește prețuri și istoric; administrează Watchlist"| Dashboard
+    Dashboard -->|"Solicită date de piață folosind credențiale păstrate pe server"| Provider
+    Provider -->|"Returnează date întârziate sau erori"| Dashboard
+```
+
+## 2. Diagrama Container
+
+Aplicația este împărțită în trei containere: Web Client, Dashboard Application și Dashboard Database.
+
+```mermaid
+flowchart LR
+    User["Utilizator autentificat"]
+    Provider["Market Data Provider"]
+
+    subgraph Dashboard["Personal Investment Dashboard"]
+        Web["Web Client\nInterfață utilizator"]
+        App["Dashboard Application\nAPI, autentificare, reguli de acces și sincronizare"]
+        DB[("Dashboard Database\nUtilizatori, Watchlist-uri și date de piață")]
+
+        Web -->|"Trimite cereri HTTPS și primește răspunsuri"| App
+        App -->|"Citește și salvează date"| DB
+    end
+
+    User -->|"Utilizează interfața web"| Web
+    App -->|"Solicită date prin conexiune server-to-server"| Provider
+    Provider -->|"Returnează date întârziate sau erori"| App
+```
+
+### Responsabilitățile containerelor
+
+- **Web Client** — permite răsfoirea acțiunilor, afișarea prețurilor și istoricului și administrarea Watchlist-ului.
+- **Dashboard Application** — verifică identitatea, validează datele de intrare, aplică regulile de acces și coordonează sincronizarea.
+- **Dashboard Database** — păstrează utilizatorii, Watchlist-urile private și datele de piață acceptate.
+- **Market Data Provider** — furnizează date întârziate și poate returna date invalide, timeout sau erori de limitare a cererilor.
+
+## 3. Diagrama Component
+
+Diagrama deschide numai Dashboard Application. Componentele sunt responsabilități logice din aplicație, nu clase sau servicii instalate separat.
+
+```mermaid
+flowchart LR
+    Web["Web Client"]
+    DB[("Dashboard Database")]
+    Provider["Market Data Provider"]
+
+    subgraph App["Dashboard Application"]
+        Access["Identity and Access Control\nAutentificare și verificarea permisiunilor"]
+        Catalog["Stock Catalog\nFiltrarea acțiunilor și gestionarea cererilor"]
+        Watchlist["Watchlist Manager\nGestionarea Watchlist-urilor private"]
+        Scheduler["Market Data Sync Scheduler\nVerificarea vechimii și pornirea sincronizării"]
+        Reader["Market Data Reader\nCitirea datelor acceptate"]
+        Coordinator["Sync Coordinator\nCoordonarea sincronizării"]
+        Client["Provider Client\nComunicarea cu furnizorul"]
+        Validator["Record Validator\nValidarea datelor primite"]
+        Writer["Market Data Writer\nSalvarea datelor validate"]
+
+        Access -->|"Identitate verificată"| Catalog
+        Access -->|"Identitate verificată"| Watchlist
+        Catalog -->|"Cere date de piață"| Scheduler
+        Scheduler -->|"Citește datele existente"| Reader
+        Scheduler -->|"Pornește sincronizarea necesară"| Coordinator
+        Coordinator -->|"Solicită date"| Client
+        Coordinator -->|"Validează răspunsul"| Validator
+        Coordinator -->|"Salvează datele acceptate"| Writer
+    end
+
+    Web -->|"Cereri HTTPS"| Access
+    Web -->|"Cereri pentru Stocks și prețuri"| Catalog
+    Web -->|"Cereri pentru Watchlist"| Watchlist
+    Reader -->|"Citește date"| DB
+    Watchlist -->|"Citește și modifică Watchlist-uri"| DB
+    Writer -->|"Salvează date și progres"| DB
+    Client -->|"Cereri cu credențiale păstrate pe server"| Provider
+    Provider -->|"Date întârziate sau erori"| Client
+```
+
+### Responsabilitățile componentelor
+
+- **Identity and Access Control** — autentifică utilizatorii și verifică permisiunile.
+- **Stock Catalog** — validează simbolurile și filtrele pentru acțiuni.
+- **Watchlist Manager** — verifică proprietarul și modifică Watchlist-ul privat.
+- **Market Data Sync Scheduler** — decide dacă datele existente pot fi utilizate sau este necesară sincronizarea.
+- **Market Data Reader** — citește datele salvate și verifică vechimea lor.
+- **Sync Coordinator** — coordonează procesul de sincronizare.
+- **Provider Client** — comunică cu furnizorul și gestionează erorile.
+- **Record Validator** — verifică validitatea datelor primite.
+- **Market Data Writer** — salvează datele validate în baza de date.
+
+## 4. Diagrame de secvență
+
+### A. Sincronizează datele de piață
+
+**Ipoteze inițiale:**
+
+- Sincronizarea poate fi pornită de un proces programat sau când datele lipsesc ori sunt prea vechi.
+- Răspunsul furnizorului este validat înainte de salvare.
+- Datele invalide nu înlocuiesc datele acceptate anterior.
+- La timeout, limitarea cererilor sau indisponibilitatea furnizorului, sincronizarea eșuează.
+- Credențialele furnizorului rămân pe server.
+
+```mermaid
+sequenceDiagram
+    actor User as Utilizator
+    participant Web as Web Client
+    participant App as Dashboard Application
+    participant Scheduler as Market Data Sync Scheduler
+    participant Coordinator as Sync Coordinator
+    participant Client as Provider Client
+    participant Provider as Market Data Provider
+    participant Validator as Record Validator
+    participant Writer as Market Data Writer
+    participant DB as Dashboard Database
+
+    alt Sincronizare programată
+        Scheduler->>Coordinator: Pornește sincronizarea
+    else Date lipsă sau prea vechi
+        User->>Web: Solicită prețuri sau istoric
+        Web->>App: Cere date pentru Stocks
+        App->>Scheduler: Verifică disponibilitatea datelor
+        Scheduler->>DB: Verifică datele și timestamp-ul
+        DB-->>Scheduler: Date lipsă sau prea vechi
+        Scheduler->>Coordinator: Pornește sincronizarea
+    end
+
+    Coordinator->>Client: Solicită date de piață
+    Client->>Provider: Trimite cererea cu credențiale server-side
+
+    alt Furnizorul returnează date
+        Provider-->>Client: Date de piață întârziate
+        Client-->>Coordinator: Răspuns primit
+        Coordinator->>Validator: Validează datele
+
+        alt Date valide
+            Validator-->>Coordinator: Date acceptate
+            Coordinator->>Writer: Cere salvarea datelor
+            Writer->>DB: Salvează date și progres
+            DB-->>Writer: Salvare confirmată
+            Writer-->>Coordinator: Salvare reușită
+            Coordinator-->>Scheduler: Sincronizare reușită
+            Note over DB: Datele devin disponibile pentru citirile ulterioare după confirmarea salvării
+        else Date invalide
+            Validator-->>Coordinator: Date respinse
+            Coordinator-->>Scheduler: Sincronizare eșuată
+            Note over DB: Datele acceptate anterior rămân neschimbate
+        end
+    else Timeout, limitare de cereri sau furnizor indisponibil
+        Provider--xClient: Timeout sau eroare
+        Client-->>Coordinator: Raportează eșecul
+        Coordinator-->>Scheduler: Sincronizare eșuată
+        Note over DB: Datele acceptate anterior rămân în baza de date
+    end
+
+    opt Cererea utilizatorului încă așteaptă
+        Scheduler-->>App: Date acceptate sau indisponibilitate
+        App-->>Web: Returnează date sau eroare
+        Web-->>User: Afișează rezultatul și timpul datelor
+    end
+```
+
+**Rezultat:** numai datele validate și salvate cu succes devin disponibile pentru citirile ulterioare. Dacă sincronizarea eșuează, datele acceptate anterior rămân în baza de date, dar trebuie verificată vechimea lor înainte de afișare.
+
+### B. Citește prețul unui Stock
+
+**Ipoteze inițiale:**
+
+- Utilizatorul trebuie să fie autentificat.
+- Simbolul Stock-ului este validat înainte de citire.
+- O citire normală utilizează datele acceptate din baza de date și nu trimite o cerere nouă furnizorului.
+- Dacă datele lipsesc sau sunt prea vechi, aplicația poate porni o sincronizare.
+- O eroare de stocare este tratată separat de un preț lipsă.
+- Datele care depășesc limita de vechime nu sunt prezentate drept actuale.
+
+```mermaid
+sequenceDiagram
+    actor User as Utilizator
+    participant Web as Web Client
+    participant App as Dashboard Application
+    participant Access as Identity and Access Control
+    participant Catalog as Stock Catalog
+    participant Scheduler as Market Data Sync Scheduler
+    participant Reader as Market Data Reader
+    participant DB as Dashboard Database
+
+    User->>Web: Solicită prețul unui Stock
+    Web->>App: Trimite token și simbol
+    App->>Access: Verifică identitatea
+
+    alt Identitate invalidă
+        Access-->>App: Identitate respinsă
+        App-->>Web: 401 - Autentificare necesară
+        Web-->>User: Cere autentificarea
+    else Identitate validă
+        Access-->>App: Identitate confirmată
+        App->>Catalog: Validează simbolul
+
+        alt Simbol invalid
+            Catalog-->>App: Date de intrare invalide
+            App-->>Web: 400 - Cerere invalidă
+            Web-->>User: Afișează eroarea
+        else Simbol valid
+            Catalog->>Scheduler: Cere prețul
+            Scheduler->>Reader: Citește datele acceptate
+            Reader->>DB: Solicită preț și timestamp
+
+            alt Defectare a stocării
+                DB--xReader: Eroare la citire
+                Reader-->>Scheduler: Stocare indisponibilă
+                Scheduler-->>Catalog: Rezultat indisponibil
+                Catalog-->>App: Eroare temporară
+                App-->>Web: 503 - Date temporar indisponibile
+                Web-->>User: Afișează eroarea
+            else Preț lipsă
+                DB-->>Reader: Nu există preț
+                Reader-->>Scheduler: Date lipsă
+                Scheduler->>Scheduler: Încearcă sincronizarea în limita termenului
+
+                alt Sincronizare reușită
+                    Scheduler->>Reader: Recitește datele salvate
+                    Reader->>DB: Cere prețul nou
+                    DB-->>Reader: Preț și timestamp
+                    Reader-->>Scheduler: Date disponibile
+                    Scheduler-->>Catalog: Preț acceptat
+                    Catalog-->>App: Preț și timestamp
+                    App-->>Web: 200 - Preț disponibil
+                    Web-->>User: Afișează prețul și timpul datelor
+                else Sincronizare eșuată
+                    Scheduler-->>Catalog: Preț indisponibil
+                    Catalog-->>App: Date indisponibile
+                    App-->>Web: 503 - Preț indisponibil
+                    Web-->>User: Afișează indisponibilitatea
+                end
+            else Preț prea vechi
+                DB-->>Reader: Preț cu timestamp depășit
+                Reader-->>Scheduler: Date expirate
+                Scheduler->>Scheduler: Încearcă sincronizarea
+
+                alt Date noi salvate
+                    Scheduler->>Reader: Recitește prețul
+                    Reader->>DB: Citește datele actualizate
+                    DB-->>Reader: Preț nou și timestamp
+                    Reader-->>Scheduler: Date verificate
+                    Scheduler-->>Catalog: Preț acceptat
+                    Catalog-->>App: Preț și timestamp
+                    App-->>Web: 200 - Preț disponibil
+                    Web-->>User: Afișează prețul și timpul datelor
+                else Date suficient de recente indisponibile
+                    Scheduler-->>Catalog: Date prea vechi sau indisponibile
+                    Catalog-->>App: Preț neconfirmat
+                    App-->>Web: 503 - Date actuale indisponibile
+                    Web-->>User: Explică faptul că prețul nu poate fi confirmat ca suficient de recent
+                end
+            else Preț suficient de recent
+                DB-->>Reader: Preț acceptat și timestamp
+                Reader-->>Scheduler: Preț verificat
+                Scheduler-->>Catalog: Preț disponibil
+                Catalog-->>App: Preț și timestamp
+                App-->>Web: 200 - Preț disponibil
+                Web-->>User: Afișează prețul și timpul datelor
+            end
+        end
+    end
+```
+
+**Rezultat:** citirea normală nu contactează direct Market Data Provider. O sincronizare poate fi pornită dacă prețul lipsește sau este prea vechi. Dacă nu există date suficient de recente, utilizatorul primește un mesaj clar de indisponibilitate.
+
+### C. Modifică un Watchlist privat
+
+**Ipoteze inițiale:**
+
+- Utilizatorul trebuie să fie autentificat.
+- Identificatorul Watchlist-ului și operația solicitată sunt validate.
+- Numai proprietarul poate modifica Watchlist-ul.
+- Succesul este raportat după confirmarea salvării în baza de date.
+- Dacă stocarea eșuează, aplicația nu confirmă modificarea.
+- Următoarea citire a aceluiași utilizator trebuie să reflecte modificarea confirmată.
+
+```mermaid
+sequenceDiagram
+    actor User as Utilizator
+    participant Web as Web Client
+    participant App as Dashboard Application
+    participant Access as Identity and Access Control
+    participant Watchlist as Watchlist Manager
+    participant DB as Dashboard Database
+
+    User->>Web: Adaugă sau elimină un Stock
+    Web->>App: Trimite cererea și tokenul
+    App->>Access: Verifică identitatea
+
+    alt Identitate invalidă
+        Access-->>App: Identitate respinsă
+        App-->>Web: 401 - Autentificare necesară
+        Web-->>User: Cere autentificarea
+    else Identitate validă
+        Access-->>App: Identitate confirmată
+        App->>Watchlist: Trimite operația
+        Watchlist->>Watchlist: Validează datele de intrare
+
+        alt Date de intrare invalide
+            Watchlist-->>App: Date invalide
+            App-->>Web: 400 - Cerere invalidă
+            Web-->>User: Afișează eroarea
+        else Date valide
+            Watchlist->>DB: Verifică proprietarul Watchlist-ului
+
+            alt Utilizator neautorizat
+                DB-->>Watchlist: Proprietate neconfirmată
+                Watchlist-->>App: Acces refuzat
+                App-->>Web: 403 - Operație neautorizată
+                Web-->>User: Afișează refuzul; lista rămâne neschimbată
+            else Utilizatorul este proprietarul
+                DB-->>Watchlist: Proprietar confirmat
+                Watchlist->>DB: Salvează modificarea
+
+                alt Salvare reușită
+                    DB-->>Watchlist: Tranzacție confirmată
+                    Note over Watchlist,DB: Punctul de succes este confirmarea salvării în baza de date
+                    Watchlist-->>App: Modificare salvată
+                    App-->>Web: 200 - Watchlist actualizat
+                    Web-->>User: Afișează succesul
+
+                    User->>Web: Citește din nou Watchlist-ul
+                    Web->>App: Cere Watchlist-ul
+                    App->>Access: Verifică identitatea
+                    Access-->>App: Identitate confirmată
+                    App->>Watchlist: Cere lista utilizatorului
+                    Watchlist->>DB: Citește lista salvată
+                    DB-->>Watchlist: Lista actualizată
+                    Watchlist-->>App: Returnează lista
+                    App-->>Web: Returnează Watchlist-ul
+                    Web-->>User: Afișează modificarea confirmată
+                else Eroare la salvare
+                    DB--xWatchlist: Eroare de stocare
+                    Watchlist-->>App: Modificare neconfirmată
+                    App-->>Web: 503 - Salvarea a eșuat
+                    Web-->>User: Afișează eroarea; nu afirmă succesul
+                end
+            end
+        end
+    end
+```
+
+**Rezultat:** operația este reușită numai după confirmarea tranzacției din baza de date. O încercare neautorizată nu modifică lista. După o modificare confirmată, următoarea citire a aceluiași utilizator trebuie să afișeze noua stare salvată.
+
+## Verificare finală
+
+- [x] Am inclus diagrama System Context.
+- [x] Am inclus diagrama Container.
+- [x] Am inclus diagrama Component.
+- [x] Am inclus cele trei diagrame de secvență.
+- [x] Toate cele șase diagrame sunt în blocuri de cod `mermaid`.
+- [x] Diagrama Component deschide numai Dashboard Application.
+- [x] Fluxurile includ rezultate normale, respingeri și defectări.
+- [x] Datele invalide nu înlocuiesc datele acceptate anterior.
+- [x] Citirile normale folosesc datele salvate.
+- [x] Watchlist-ul este privat și verifică proprietarul înainte de modificare.
+- [x] Succesul Watchlist-ului este raportat numai după salvarea confirmată.
+- [x] Credențialele furnizorului rămân pe server.
+
+**Notă:** pragul numeric de vechime a datelor și țintele exacte pentru volumul de lucru trebuie preluate din Laboratorul 2. Nu sunt inventate aici, deoarece valorile respective nu apar în enunțul disponibil.
